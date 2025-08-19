@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.location.Location
 import android.os.Build
 import android.os.IBinder
 import android.os.Looper
@@ -21,27 +22,35 @@ import android.util.Log
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import com.google.android.gms.location.*
-import java.util.concurrent.Executor
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.launch
 
 class MonitoringService : Service() {
 
     private val channelId = "PolarisServiceChannel"
 
-    // Location variables
+    // Location
     private lateinit var fusedLocationClient: FusedLocationProviderClient
     private lateinit var locationCallback: LocationCallback
+    private var lastLocation: Location? = null
 
-    // Telephony variables
+    // Telephony
     private lateinit var telephonyManager: TelephonyManager
     private lateinit var telephonyCallback: TelephonyCallback
+
+    // Database
+    private lateinit var db: AppDatabase
+    private lateinit var networkLogDao: NetworkLogDao
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
 
-        // Initialize clients
+        // Initialize clients and DB
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
         telephonyManager = getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+        db = AppDatabase.getDatabase(this)
+        networkLogDao = db.networkLogDao()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -62,7 +71,6 @@ class MonitoringService : Service() {
     }
 
     private fun startLocationUpdates() {
-        // ... (this function remains unchanged)
         val locationRequest = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 5000)
             .setWaitForAccurateLocation(false)
             .setMinUpdateIntervalMillis(3000)
@@ -72,12 +80,12 @@ class MonitoringService : Service() {
             override fun onLocationResult(locationResult: LocationResult) {
                 for (location in locationResult.locations){
                     Log.d("MonitoringService", "New Location: Lat: ${location.latitude}, Lon: ${location.longitude}")
+                    lastLocation = location // Store the most recent location
                 }
             }
         }
 
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            Log.e("MonitoringService", "Location permission not granted, stopping service.")
             stopSelf()
             return
         }
@@ -86,45 +94,44 @@ class MonitoringService : Service() {
     }
 
     private fun startTelephonyUpdates() {
-        // This Executor will run the callback
-        val executor = mainExecutor
-
-        // Create the callback
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             telephonyCallback = object : TelephonyCallback(), TelephonyCallback.CellInfoListener {
                 override fun onCellInfoChanged(cellInfo: MutableList<CellInfo>) {
                     Log.d("MonitoringService", "Cell Info Changed:")
-                    logCellInfo(cellInfo)
+                    saveCellInfo(cellInfo) // Call the new save function
                 }
             }
-            telephonyManager.registerTelephonyCallback(executor, telephonyCallback)
+            telephonyManager.registerTelephonyCallback(mainExecutor, telephonyCallback)
         }
     }
 
-    private fun logCellInfo(cellInfo: List<CellInfo>) {
+    private fun saveCellInfo(cellInfo: List<CellInfo>) {
         for (info in cellInfo) {
-            if (info.isRegistered) { // We only care about the cell the phone is currently connected to
+            if (info.isRegistered) {
+                var log: NetworkLog? = null
                 when (info) {
-                    is CellInfoLte -> { // 4G
+                    is CellInfoLte -> {
                         val cellIdentity = info.cellIdentity
                         val cellSignal = info.cellSignalStrength
-                        Log.i("MonitoringService", "Type: LTE (4G)")
-                        Log.i("MonitoringService", "   PLMN-Id: ${cellIdentity.mccString}${cellIdentity.mncString}, TAC: ${cellIdentity.tac}, Cell ID: ${cellIdentity.ci}")
-                        Log.i("MonitoringService", "   RSRP: ${cellSignal.rsrp} dBm, RSRQ: ${cellSignal.rsrq} dB")
+                        log = NetworkLog(
+                            timestamp = System.currentTimeMillis(),
+                            latitude = lastLocation?.latitude,
+                            longitude = lastLocation?.longitude,
+                            networkType = "LTE",
+                            plmnId = "${cellIdentity.mccString}${cellIdentity.mncString}",
+                            tac = cellIdentity.tac,
+                            cellId = cellIdentity.ci,
+                            rsrp = cellSignal.rsrp,
+                            rsrq = cellSignal.rsrq
+                        )
                     }
-                    is CellInfoWcdma -> { // 3G
-                        val cellIdentity = info.cellIdentity
-                        val cellSignal = info.cellSignalStrength
-                        Log.i("MonitoringService", "Type: WCDMA (3G)")
-                        Log.i("MonitoringService", "   PLMN-Id: ${cellIdentity.mccString}${cellIdentity.mncString}, LAC: ${cellIdentity.lac}, Cell ID: ${cellIdentity.cid}")
-                        Log.i("MonitoringService", "   RSCP: ${cellSignal.dbm} dBm")
-                    }
-                    is CellInfoGsm -> { // 2G
-                        val cellIdentity = info.cellIdentity
-                        val cellSignal = info.cellSignalStrength
-                        Log.i("MonitoringService", "Type: GSM (2G)")
-                        Log.i("MonitoringService", "   PLMN-Id: ${cellIdentity.mccString}${cellIdentity.mncString}, LAC: ${cellIdentity.lac}, Cell ID: ${cellIdentity.cid}")
-                        Log.i("MonitoringService", "   RxLev: ${cellSignal.dbm} dBm")
+                    // Add cases for WCDMA and GSM here if needed
+                }
+
+                log?.let {
+                    GlobalScope.launch {
+                        networkLogDao.insert(it)
+                        Log.i("MonitoringService", "Successfully saved log to database.")
                     }
                 }
             }
@@ -140,16 +147,11 @@ class MonitoringService : Service() {
         Log.d("MonitoringService", "Service is being destroyed. All updates stopped.")
     }
 
-    override fun onBind(intent: Intent?): IBinder? {
-        return null
-    }
+    override fun onBind(intent: Intent?): IBinder? = null
 
     private fun createNotificationChannel() {
-        // ... (this function remains unchanged)
         val serviceChannel = NotificationChannel(
-            channelId,
-            "Polaris Service Channel",
-            NotificationManager.IMPORTANCE_DEFAULT
+            channelId, "Polaris Service Channel", NotificationManager.IMPORTANCE_DEFAULT
         )
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(serviceChannel)
