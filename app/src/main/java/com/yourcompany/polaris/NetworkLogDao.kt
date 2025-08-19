@@ -11,4 +11,8 @@ interface NetworkLogDao {
 
     @Query("SELECT * FROM network_logs ORDER BY timestamp DESC")
     suspend fun getAll(): List<NetworkLog>
+
+    // ADD THIS FUNCTION
+    @Query("DELETE FROM network_logs WHERE id IN (:logIds)")
+    suspend fun deleteLogs(logIds: List<Int>)
 }

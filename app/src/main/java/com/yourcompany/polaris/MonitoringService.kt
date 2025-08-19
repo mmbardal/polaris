@@ -21,16 +21,28 @@ import android.telephony.TelephonyManager
 import android.util.Log
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
-import com.google.android.gms.location.*
-import kotlinx.coroutines.GlobalScope
+import com.google.android.gms.location.LocationCallback
+import com.google.android.gms.location.LocationRequest
+import com.google.android.gms.location.LocationResult
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 class MonitoringService : Service() {
 
     private val channelId = "PolarisServiceChannel"
 
+    // A custom CoroutineScope tied to the service's lifecycle for managing background tasks.
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
     // Location
-    private lateinit var fusedLocationClient: FusedLocationProviderClient
+    private lateinit var fusedLocationClient: com.google.android.gms.location.FusedLocationProviderClient
     private lateinit var locationCallback: LocationCallback
     private var lastLocation: Location? = null
 
@@ -38,19 +50,15 @@ class MonitoringService : Service() {
     private lateinit var telephonyManager: TelephonyManager
     private lateinit var telephonyCallback: TelephonyCallback
 
-    // Database
-    private lateinit var db: AppDatabase
-    private lateinit var networkLogDao: NetworkLogDao
+    // Database (initialized lazily to ensure context is available)
+    private val db by lazy { AppDatabase.getDatabase(this) }
+    private val networkLogDao by lazy { db.networkLogDao() }
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-
-        // Initialize clients and DB
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
         telephonyManager = getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
-        db = AppDatabase.getDatabase(this)
-        networkLogDao = db.networkLogDao()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -66,21 +74,22 @@ class MonitoringService : Service() {
 
         startLocationUpdates()
         startTelephonyUpdates()
+        startSyncJob() // Start the coroutine-based sync job
 
         return START_STICKY
     }
 
     private fun startLocationUpdates() {
-        val locationRequest = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 5000)
+        val locationRequest = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 50)
             .setWaitForAccurateLocation(false)
-            .setMinUpdateIntervalMillis(3000)
+            .setMinUpdateIntervalMillis(50)
             .build()
 
         locationCallback = object : LocationCallback() {
             override fun onLocationResult(locationResult: LocationResult) {
                 for (location in locationResult.locations){
                     Log.d("MonitoringService", "New Location: Lat: ${location.latitude}, Lon: ${location.longitude}")
-                    lastLocation = location // Store the most recent location
+                    lastLocation = location
                 }
             }
         }
@@ -98,7 +107,7 @@ class MonitoringService : Service() {
             telephonyCallback = object : TelephonyCallback(), TelephonyCallback.CellInfoListener {
                 override fun onCellInfoChanged(cellInfo: MutableList<CellInfo>) {
                     Log.d("MonitoringService", "Cell Info Changed:")
-                    saveCellInfo(cellInfo) // Call the new save function
+                    saveCellInfo(cellInfo)
                 }
             }
             telephonyManager.registerTelephonyCallback(mainExecutor, telephonyCallback)
@@ -106,14 +115,16 @@ class MonitoringService : Service() {
     }
 
     private fun saveCellInfo(cellInfo: List<CellInfo>) {
+        // Don't save logs until we have a location fix
+        if (lastLocation == null) return
+
         for (info in cellInfo) {
             if (info.isRegistered) {
-                var log: NetworkLog? = null
-                when (info) {
-                    is CellInfoLte -> {
+                val log = when (info) {
+                    is CellInfoLte -> { // 4G Network
                         val cellIdentity = info.cellIdentity
                         val cellSignal = info.cellSignalStrength
-                        log = NetworkLog(
+                        NetworkLog(
                             timestamp = System.currentTimeMillis(),
                             latitude = lastLocation?.latitude,
                             longitude = lastLocation?.longitude,
@@ -125,23 +136,85 @@ class MonitoringService : Service() {
                             rsrq = cellSignal.rsrq
                         )
                     }
-                    // Add cases for WCDMA and GSM here if needed
+                    is CellInfoWcdma -> { // 3G Network
+                        val cellIdentity = info.cellIdentity
+                        val cellSignal = info.cellSignalStrength
+                        NetworkLog(
+                            timestamp = System.currentTimeMillis(),
+                            latitude = lastLocation?.latitude,
+                            longitude = lastLocation?.longitude,
+                            networkType = "WCDMA",
+                            plmnId = "${cellIdentity.mccString}${cellIdentity.mncString}",
+                            tac = cellIdentity.lac, // 3G uses LAC, we can map it to TAC
+                            cellId = cellIdentity.cid,
+                            rsrp = cellSignal.dbm, // 3G's RSCP is reported in dbm
+                            rsrq = null // RSRQ is not available in 3G
+                        )
+                    }
+                    is CellInfoGsm -> { // 2G Network
+                        val cellIdentity = info.cellIdentity
+                        val cellSignal = info.cellSignalStrength
+                        NetworkLog(
+                            timestamp = System.currentTimeMillis(),
+                            latitude = lastLocation?.latitude,
+                            longitude = lastLocation?.longitude,
+                            networkType = "GSM",
+                            plmnId = "${cellIdentity.mccString}${cellIdentity.mncString}",
+                            tac = cellIdentity.lac, // 2G uses LAC
+                            cellId = cellIdentity.cid,
+                            rsrp = cellSignal.dbm, // 2G's RxLev is reported in dbm
+                            rsrq = null // RSRQ is not available in 2G
+                        )
+                    }
+                    else -> null // For other network types we don't handle
                 }
 
+                // If a log object was created, save it to the database.
                 log?.let {
-                    GlobalScope.launch {
+                    serviceScope.launch {
                         networkLogDao.insert(it)
-                        Log.i("MonitoringService", "Successfully saved log to database.")
+                        Log.i("MonitoringService", "Successfully saved ${it.networkType} log to database.")
                     }
                 }
             }
         }
     }
 
+    private fun startSyncJob() {
+        serviceScope.launch {
+            while (isActive) { // This loop runs as long as the service scope is active
+                syncLogsToServer()
+                delay(60000L) // Wait for 60 seconds
+            }
+        }
+    }
+
+    private suspend fun syncLogsToServer() {
+        val logs = networkLogDao.getAll()
+        if (logs.isNotEmpty()) {
+            val serializableLogs = logs.map {
+                NetworkLogSerializable(it.timestamp, it.latitude, it.longitude, it.networkType, it.plmnId, it.tac, it.cellId, it.rsrp, it.rsrq)
+            }
+
+            val success = ApiClient.submitLogs(serializableLogs)
+            if (success) {
+                Log.i("MonitoringService", "Successfully sent ${logs.size} logs to server.")
+                networkLogDao.deleteLogs(logs.map { it.id })
+            } else {
+                Log.e("MonitoringService", "Failed to send logs to server.")
+            }
+        } else {
+            Log.d("MonitoringService", "No logs to sync.")
+        }
+    }
+
     override fun onDestroy() {
         super.onDestroy()
+        // Cancel all coroutines started by this scope when the service is destroyed.
+        serviceScope.cancel()
+
         fusedLocationClient.removeLocationUpdates(locationCallback)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && this::telephonyCallback.isInitialized) {
             telephonyManager.unregisterTelephonyCallback(telephonyCallback)
         }
         Log.d("MonitoringService", "Service is being destroyed. All updates stopped.")

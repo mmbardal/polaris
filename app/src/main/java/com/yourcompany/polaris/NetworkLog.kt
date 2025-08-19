@@ -2,7 +2,9 @@ package com.yourcompany.polaris
 
 import androidx.room.Entity
 import androidx.room.PrimaryKey
+import kotlinx.serialization.Serializable // Import this
 
+@Serializable // Add this annotation
 @Entity(tableName = "network_logs")
 data class NetworkLog(
     @PrimaryKey(autoGenerate = true)
