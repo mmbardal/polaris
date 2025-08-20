@@ -21,6 +21,8 @@ data class LogPayload(val logs: List<NetworkLogSerializable>)
  * A serializable version of our NetworkLog entity.
  * This class is used for sending data over the network.
  */
+// In ApiClient.kt
+
 @Serializable
 data class NetworkLogSerializable(
     val timestamp: Long,
@@ -30,9 +32,22 @@ data class NetworkLogSerializable(
     val plmnId: String?,
     val tac: Int?,
     val cellId: Int?,
+    // LTE
     val rsrp: Int?,
-    val rsrq: Int?
+    val rsrq: Int?,
+    // 3G
+    val rscp: Int?,
+    val ecno: Int?,
+    // 2G
+    val rxlev: Int?,
+    // All
+    val arfcn: Int?,
+    val band: String?
 )
+
+// The syncLogsToServer function in MonitoringService.kt will need to be updated
+// to map all the new fields from the NetworkLog object to the NetworkLogSerializable object.
+// The mapping is straightforward as the names are the same.
 
 object ApiClient {
     /**
