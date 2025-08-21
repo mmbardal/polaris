@@ -76,8 +76,7 @@ object ApiClient {
 
     // !! IMPORTANT !!
     // Replace this with the actual IP address of the computer running your server.
-    private const val SERVER_IP = "192.168.246.3" // Example IP
-
+    private const val SERVER_IP = "192.168.100.104"// IP
     private const val SUBMIT_URL = "http://$SERVER_IP:3000/api/v1/panel/submitLogs"
 
     /**
